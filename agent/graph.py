@@ -16,6 +16,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph, add_messages
 from langgraph.prebuilt import InjectedState, ToolNode
 
+from agent.tool_safety import filter_duplicate_tool_calls
 from agent.tools import (
     calculate,
     get_sla_metrics,
@@ -92,7 +93,11 @@ TOOL SELECTION STRATEGY:
 - Use ticket_lookup for each distinct ticket ID requested.
 - Use sla_lookup for support performance questions.
 - Use calculator for arithmetic when appropriate.
-- Use live_web_search for current external information.
+- Use live_web_search at most once per user request.
+  Combine related current-information topics into one focused
+  search query.
+- After a live web search, reuse its results instead of searching
+  again in the same request.
 - Use memory search when relevant saved context may help.
 - Do not call tools that are not needed.
 
@@ -116,6 +121,7 @@ EXECUTION RULES:
 - Never exceed the configured tool execution limit.
 - Do not repeat an identical tool request.
 - Do not repeat an internal document search in the same request.
+- Do not repeat a live web search in the same request.
 - After receiving tool results, synthesize the answer instead
   of requesting the same information again.
 - Clearly separate different information sources in
@@ -423,58 +429,39 @@ def build_agent_graph(checkpointer):
         previous_errors = state.get("errors", [])
         executed_calls = set(state.get("executed_tool_calls", []))
 
-        fresh_calls = []
+        # Centralized duplicate and single-use tool filtering.
+        fresh_calls, duplicate_calls, fingerprints_by_call_id = (
+            filter_duplicate_tool_calls(
+                tool_calls=tool_calls,
+                executed_tool_calls=executed_calls,
+            )
+        )
+
         duplicate_messages = []
-        fingerprints_by_call_id = {}
 
-        for call in tool_calls:
+        for call in duplicate_calls:
             name = call["name"]
-            arguments = call.get("args", {})
 
-            fingerprint = create_tool_fingerprint(name, arguments)
-
-            # Internal document search is limited to one call per run.
-            rag_already_used = (
-                name == "search_operations_documents"
-                and any(
-                    item.startswith(
-                        '{"arguments":'
-                    )
-                    and '"tool": "search_operations_documents"' in item
-                    for item in executed_calls
+            duplicate_messages.append(
+                ToolMessage(
+                    content=(
+                        "This tool request was not executed because "
+                        "the same request, or a single-use tool, "
+                        "has already been used during this request. "
+                        "Reuse the previous tool result in the "
+                        "conversation and proceed to the answer. "
+                        "Do not retry this request."
+                    ),
+                    tool_call_id=call["id"],
+                    name=name,
                 )
             )
 
-            is_duplicate = (
-                fingerprint in executed_calls
-                or rag_already_used
+            log_event(
+                "duplicate_tool_call_blocked",
+                run_id,
+                {"tool": name},
             )
-
-            if is_duplicate:
-                duplicate_messages.append(
-                    ToolMessage(
-                        content=(
-                            "This tool request was not executed because "
-                            "the same request, or an internal document "
-                            "search for this run, has already been used. "
-                            "Reuse the previous tool result in the "
-                            "conversation and proceed to the answer. "
-                            "Do not retry this request."
-                        ),
-                        tool_call_id=call["id"],
-                        name=name,
-                    )
-                )
-
-                log_event(
-                    "duplicate_tool_call_blocked",
-                    run_id,
-                    {"tool": name},
-                )
-                continue
-
-            fresh_calls.append(call)
-            fingerprints_by_call_id[call["id"]] = fingerprint
 
         current_tools = [call["name"] for call in fresh_calls]
 
@@ -484,7 +471,7 @@ def build_agent_graph(checkpointer):
             {
                 "requested_count": len(tool_calls),
                 "executable_count": len(fresh_calls),
-                "blocked_duplicate_count": len(duplicate_messages),
+                "blocked_duplicate_count": len(duplicate_calls),
                 "tools": current_tools,
             },
         )
@@ -539,7 +526,10 @@ def build_agent_graph(checkpointer):
         new_errors = []
 
         for tool_message in actual_tool_messages:
-            tool_name = getattr(tool_message, "name", None) or "unknown_tool"
+            tool_name = (
+                getattr(tool_message, "name", None)
+                or "unknown_tool"
+            )
             tool_status = getattr(tool_message, "status", "success")
             tool_content = getattr(tool_message, "content", None)
 
@@ -599,6 +589,7 @@ def build_agent_graph(checkpointer):
 
         updated_errors = previous_errors + new_errors
 
+        # Persist fingerprints for all tools that actually executed.
         for call in fresh_calls:
             executed_calls.add(
                 fingerprints_by_call_id[call["id"]]
@@ -610,7 +601,7 @@ def build_agent_graph(checkpointer):
             {
                 "requested_tool_count": len(tool_calls),
                 "executed_tool_count": len(fresh_calls),
-                "blocked_duplicate_count": len(duplicate_messages),
+                "blocked_duplicate_count": len(duplicate_calls),
                 "error_count": len(new_errors),
                 "source_count": len(new_sources),
             },
