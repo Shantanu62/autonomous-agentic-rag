@@ -344,7 +344,7 @@ Run the complete test suite:
 python -m pytest -q
 ```
 
-**Latest verified result: 23 tests passed.**
+**Latest verified result: 55 tests passed (full regression suite).**
 
 ## Deployment
 
@@ -399,9 +399,9 @@ The application uses external Groq, Tavily, and Qdrant services. Their availabil
 - [x] Qdrant long-term memory
 - [x] Execution limits and error recovery
 - [x] Observability and run details
-- [x] Initial automated regression tests
+- [x] Full automated regression suite (55 tests passed)
 - [x] GitHub repository published
-- [ ] Public Streamlit deployment
+- [x] Public Streamlit deployment
 - [ ] Final demo video and screenshots
 
 ## Limitations
