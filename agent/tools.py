@@ -232,8 +232,28 @@ def _evaluate_math_node(node: ast.AST) -> float | int:
     raise ValueError("Unsupported expression.")
 
 
+def _normalize_math_expression(expression: str) -> str:
+    """Convert common percentage expressions into safe arithmetic syntax."""
+    normalized = expression.strip()
+
+    percentage_pattern = re.fullmatch(
+        r"(\d+(?:\.\d+)?)\s*(?:%|percent|per\s+cent)\s+of\s+"
+        r"(-?\d+(?:\.\d+)?)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    if percentage_pattern:
+        percentage = percentage_pattern.group(1)
+        number = percentage_pattern.group(2)
+
+        return f"({percentage} / 100) * ({number})"
+
+    return normalized
+
+
 def calculate(expression: str) -> dict[str, Any]:
-    """Safely calculate basic arithmetic without using eval()."""
+    """Safely calculate arithmetic and common percentage expressions."""
     normalized_expression = expression.strip() if expression else ""
 
     if not normalized_expression:
@@ -249,7 +269,11 @@ def calculate(expression: str) -> dict[str, Any]:
         }
 
     try:
-        parsed = ast.parse(normalized_expression, mode="eval")
+        safe_expression = _normalize_math_expression(
+            normalized_expression
+        )
+
+        parsed = ast.parse(safe_expression, mode="eval")
 
         if sum(1 for _ in ast.walk(parsed)) > 30:
             raise ValueError("Expression is too complex.")
