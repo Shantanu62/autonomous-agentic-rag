@@ -1,0 +1,27 @@
+
+# Frontend
+streamlit>=1.40,<2.0
+
+# Agent orchestration and LLM integration
+langgraph>=0.2,<2.0
+langchain-core>=0.3,<2.0
+langchain-groq>=0.2,<2.0
+langchain-text-splitters>=0.3,<2.0
+langgraph-checkpoint-sqlite>=2.0,<4.0
+
+# Embeddings and vector database
+sentence-transformers>=3.0,<6.0
+qdrant-client>=1.12,<2.0
+
+# Live web search
+tavily-python>=0.5,<1.0
+
+# Document processing
+pypdf>=5.0,<7.0
+python-docx>=1.1,<2.0
+
+# Environment configuration
+python-dotenv>=1.0,<2.0
+
+# Testing
+pytest>=8.0,<10.0

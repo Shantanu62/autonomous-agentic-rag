@@ -1,0 +1,5 @@
+﻿DOCUMENT: IT Asset Return Policy
+DEPARTMENT: IT Operations
+1. Employees must return company laptops within 3 working days after their last working day.
+2. All returned laptops must include the original charger.
+3. The IT Operations team is responsible for verifying returned equipment.
