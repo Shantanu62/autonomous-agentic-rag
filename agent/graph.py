@@ -8,6 +8,7 @@ from langchain_core.messages import (
     AIMessage,
     AnyMessage,
     SystemMessage,
+    ToolMessage,
 )
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
@@ -74,14 +75,29 @@ AVAILABLE TOOLS:
 9. delete_long_term_memory:
    Delete a specific memory belonging to the current user.
 
-BEHAVIOR RULES:
+TOOL SELECTION STRATEGY:
 
-- Use internal RAG for company-specific policies and SOPs.
-- Use ticket_lookup when a user mentions a ticket ID.
+- First identify every independent task in the user's request.
+- For compound questions, plan the required tool calls before
+  executing them.
+- When a question requires both internal policy information
+  and a ticket lookup, request both tools in the same tool batch.
+- Do not wait for one result before requesting another
+  independent tool.
+- Use search_operations_documents at most once per user request.
+  Combine related policy questions into one focused search query.
+- Never retry an unsuccessful RAG search by merely rephrasing
+  the same question.
+- Reuse the results already present in the conversation.
+- Use ticket_lookup for each distinct ticket ID requested.
 - Use sla_lookup for support performance questions.
-- Use calculator for arithmetic.
+- Use calculator for arithmetic when appropriate.
 - Use live_web_search for current external information.
 - Use memory search when relevant saved context may help.
+- Do not call tools that are not needed.
+
+BEHAVIOR RULES:
+
 - Save memories only when the user explicitly requests it.
 - Never save passwords, API keys, or sensitive personal data.
 - Never invent ticket information, policies, or metrics.
@@ -93,6 +109,17 @@ BEHAVIOR RULES:
 - Ask for clarification when essential information is missing.
 - Give clear and professional answers.
 - Memory tools are restricted to the authenticated user.
+
+EXECUTION RULES:
+
+- The maximum tool execution budget is strictly limited.
+- Never exceed the configured tool execution limit.
+- Do not repeat an identical tool request.
+- Do not repeat an internal document search in the same request.
+- After receiving tool results, synthesize the answer instead
+  of requesting the same information again.
+- Clearly separate different information sources in
+  compound reports.
 """
 
 
@@ -290,6 +317,28 @@ class AgentState(TypedDict):
     run_id: str
     sources: list[dict[str, Any]]
     errors: list[str]
+    executed_tool_calls: list[str]
+
+
+def create_tool_fingerprint(tool_name: str, arguments: dict) -> str:
+    """Create a stable fingerprint for an identical tool request."""
+    normalized_arguments = {}
+
+    for key, value in sorted(arguments.items()):
+        if isinstance(value, str):
+            value = " ".join(value.strip().lower().split())
+
+        normalized_arguments[key] = value
+
+    return json.dumps(
+        {
+            "tool": tool_name,
+            "arguments": normalized_arguments,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 def build_agent_graph(checkpointer):
@@ -364,7 +413,7 @@ def build_agent_graph(checkpointer):
             raise
 
     def execute_tools(state: AgentState):
-        """Execute tools and capture status, sources, and errors."""
+        """Execute permitted tools and block repeated requests."""
         run_id = state.get("run_id", "unknown")
         last_message = state["messages"][-1]
         tool_calls = getattr(last_message, "tool_calls", [])
@@ -372,36 +421,124 @@ def build_agent_graph(checkpointer):
         previous_tools = state.get("selected_tools", [])
         previous_sources = state.get("sources", [])
         previous_errors = state.get("errors", [])
+        executed_calls = set(state.get("executed_tool_calls", []))
 
-        current_tools = [
-            call["name"]
-            for call in tool_calls
-        ]
+        fresh_calls = []
+        duplicate_messages = []
+        fingerprints_by_call_id = {}
+
+        for call in tool_calls:
+            name = call["name"]
+            arguments = call.get("args", {})
+
+            fingerprint = create_tool_fingerprint(name, arguments)
+
+            # Internal document search is limited to one call per run.
+            rag_already_used = (
+                name == "search_operations_documents"
+                and any(
+                    item.startswith(
+                        '{"arguments":'
+                    )
+                    and '"tool": "search_operations_documents"' in item
+                    for item in executed_calls
+                )
+            )
+
+            is_duplicate = (
+                fingerprint in executed_calls
+                or rag_already_used
+            )
+
+            if is_duplicate:
+                duplicate_messages.append(
+                    ToolMessage(
+                        content=(
+                            "This tool request was not executed because "
+                            "the same request, or an internal document "
+                            "search for this run, has already been used. "
+                            "Reuse the previous tool result in the "
+                            "conversation and proceed to the answer. "
+                            "Do not retry this request."
+                        ),
+                        tool_call_id=call["id"],
+                        name=name,
+                    )
+                )
+
+                log_event(
+                    "duplicate_tool_call_blocked",
+                    run_id,
+                    {"tool": name},
+                )
+                continue
+
+            fresh_calls.append(call)
+            fingerprints_by_call_id[call["id"]] = fingerprint
+
+        current_tools = [call["name"] for call in fresh_calls]
 
         log_event(
             "tool_batch_started",
             run_id,
             {
+                "requested_count": len(tool_calls),
+                "executable_count": len(fresh_calls),
+                "blocked_duplicate_count": len(duplicate_messages),
                 "tools": current_tools,
-                "tool_count": len(current_tools),
             },
         )
 
-        try:
-            result = tool_node.invoke(state)
+        actual_tool_messages = []
 
-        except Exception:
-            log_event(
-                "tool_batch_failed",
-                run_id,
-                {"error": "Tool execution batch failed."},
-            )
-            raise
+        if fresh_calls:
+            try:
+                # Give ToolNode only the tool calls that passed validation.
+                filtered_message = last_message.model_copy(
+                    update={"tool_calls": fresh_calls}
+                )
+
+                temporary_state = {
+                    **state,
+                    "messages": (
+                        state["messages"][:-1]
+                        + [filtered_message]
+                    ),
+                }
+
+                result = tool_node.invoke(temporary_state)
+                actual_tool_messages = result.get("messages", [])
+
+            except Exception:
+                log_event(
+                    "tool_batch_failed",
+                    run_id,
+                    {"error": "Tool execution batch failed."},
+                )
+                raise
+
+        # Restore the original call order and provide a ToolMessage
+        # for every requested tool call, including blocked duplicates.
+        messages_by_call_id = {
+            message.tool_call_id: message
+            for message in actual_tool_messages
+        }
+
+        messages_by_call_id.update({
+            message.tool_call_id: message
+            for message in duplicate_messages
+        })
+
+        ordered_messages = [
+            messages_by_call_id[call["id"]]
+            for call in tool_calls
+            if call["id"] in messages_by_call_id
+        ]
 
         new_sources = []
         new_errors = []
 
-        for tool_message in result.get("messages", []):
+        for tool_message in actual_tool_messages:
             tool_name = getattr(tool_message, "name", None) or "unknown_tool"
             tool_status = getattr(tool_message, "status", "success")
             tool_content = getattr(tool_message, "content", None)
@@ -462,25 +599,36 @@ def build_agent_graph(checkpointer):
 
         updated_errors = previous_errors + new_errors
 
+        for call in fresh_calls:
+            executed_calls.add(
+                fingerprints_by_call_id[call["id"]]
+            )
+
         log_event(
             "tool_batch_completed",
             run_id,
             {
-                "executed_tool_count": len(tool_calls),
+                "requested_tool_count": len(tool_calls),
+                "executed_tool_count": len(fresh_calls),
+                "blocked_duplicate_count": len(duplicate_messages),
                 "error_count": len(new_errors),
                 "source_count": len(new_sources),
             },
         )
 
         return {
-            "messages": result["messages"],
+            "messages": ordered_messages,
+            # Count all requested calls against the execution budget,
+            # including blocked duplicates, to prevent retry loops.
             "tool_steps": (
                 state.get("tool_steps", 0)
                 + len(tool_calls)
             ),
+            # Record only tools that actually executed.
             "selected_tools": previous_tools + current_tools,
             "sources": unique_sources,
             "errors": updated_errors,
+            "executed_tool_calls": sorted(executed_calls),
         }
 
     def route_after_model(state: AgentState):
@@ -695,6 +843,7 @@ def run_agent(
                 "run_id": run_id,
                 "sources": [],
                 "errors": [],
+                "executed_tool_calls": [],
             },
             config=graph_config,
         )
@@ -746,6 +895,8 @@ def run_agent(
             "thread_id": normalized_thread_id,
             "tool_steps": tool_steps,
             "selected_tools": selected_tools,
+            "sources": sources,
+            "errors": errors,
             "run_details": run_details,
         }
 

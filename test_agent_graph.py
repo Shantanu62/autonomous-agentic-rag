@@ -1,10 +1,10 @@
 
+import pytest
+
 from agent.graph import AVAILABLE_TOOLS, get_agent_graph
 
 
-def main():
-    print("Initializing LangGraph agent...")
-
+def test_agent_graph_initialization():
     expected_tools = {
         "search_operations_documents",
         "ticket_lookup",
@@ -21,22 +21,8 @@ def main():
         tool.name for tool in AVAILABLE_TOOLS
     }
 
-    print("\nRegistered tools:")
-
-    for tool in AVAILABLE_TOOLS:
-        print(f"- {tool.name}")
-
-    print(f"\nTotal registered tools: {len(AVAILABLE_TOOLS)}")
-
-    assert len(AVAILABLE_TOOLS) == 9, (
-        f"Expected 9 tools, found {len(AVAILABLE_TOOLS)}"
-    )
-
-    assert actual_tools == expected_tools, (
-        "Registered tools do not match the expected tool list."
-    )
-
-    print("\nBuilding agent graph...")
+    assert len(AVAILABLE_TOOLS) == 9
+    assert actual_tools == expected_tools
 
     graph = get_agent_graph()
 
@@ -50,17 +36,4 @@ def main():
         "__end__",
     }
 
-    print("\nGraph nodes:")
-
-    for node in sorted(graph_nodes):
-        print(f"- {node}")
-
-    assert expected_nodes.issubset(graph_nodes), (
-        "One or more expected graph nodes are missing."
-    )
-
-    print("\nAgent graph initialization test PASSED!")
-
-
-if __name__ == "__main__":
-    main()
+    assert expected_nodes.issubset(graph_nodes)

@@ -1,26 +1,31 @@
 
 from uuid import uuid4
 
+import re
+import unicodedata
+
 from agent.graph import run_agent
 
 
-def main():
+def normalize_text(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
+    value = value.casefold()
+    value = re.sub(r"[\u2010-\u2015\u2212\u00ad]", "-", value)
+    return value
+
+
+def test_combined_multi_tool_workflow():
     question = (
         "I need a combined operations report. "
-        "First, use the operations documents to find "
-        "how many paid annual leave days full-time "
-        "employees receive per calendar year. "
-        "Then look up ticket TCK-1001 and report "
-        "its current status and priority. "
-        "Clearly separate the policy information "
-        "from the ticket information and cite their sources."
+        "Use the operations documents to find how many "
+        "paid annual leave days full-time employees receive "
+        "per calendar year. Also look up ticket TCK-1001 "
+        "and report its current status and priority. "
+        "Use both tools, clearly separate the two sections, "
+        "and cite the policy source."
     )
 
     thread_id = f"agent-workflow-test-{uuid4().hex[:12]}"
-
-    print("Testing combined multi-tool agent workflow...")
-    print(f"\nQuestion: {question}")
-    print(f"Fresh thread ID: {thread_id}")
 
     result = run_agent(
         question=question,
@@ -28,24 +33,29 @@ def main():
         user_id="workflow-execution-test-user",
     )
 
-    print("\nAgent execution result:")
-    print(f"Success: {result['success']}")
+    assert result["success"] is True, result
+
+    selected = result["selected_tools"]
+    answer = normalize_text(result["answer"])
+
+    assert selected.count("search_operations_documents") == 1
+    assert selected.count("ticket_lookup") == 1
+    assert result["tool_steps"] == 2
+
+    assert "20" in answer
+    assert "tck-1001" in answer
+    assert "open" in answer
+    assert "critical" in answer
+
+    sources = result.get("sources", [])
+
+    assert any(
+        source.get("source") == "company_sop.txt"
+        for source in sources
+    ), sources
+
+    print("\nCombined workflow passed!")
     print(f"Answer: {result['answer']}")
     print(f"Tool steps: {result['tool_steps']}")
-    print(f"Selected tools: {result['selected_tools']}")
-
-    if result["success"]:
-        selected = result["selected_tools"]
-
-        assert "search_operations_documents" in selected
-        assert "ticket_lookup" in selected
-        assert result["tool_steps"] >= 2
-        assert result["tool_steps"] <= 4
-
-        print("\nCOMBINED MULTI-TOOL WORKFLOW PASSED!")
-    else:
-        raise AssertionError("Multi-tool workflow failed!")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"Selected tools: {selected}")
+    print(f"Sources: {sources}")
